@@ -2,7 +2,7 @@
 <html lang="de">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <meta name="theme-color" content="#0a0e1a" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -360,15 +360,23 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html, body {
+html {
   background: var(--bg);
+}
+html, body {
   color: var(--text);
   font-family: var(--font-body);
   margin: 0;
   padding: 0;
   min-height: 100vh;
   min-height: 100dvh;
-  overscroll-behavior: none;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+}
+body {
+  background: var(--bg);
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 /* Safe areas for notched devices */
@@ -445,7 +453,6 @@ body {
 .tabular-nums { font-variant-numeric: tabular-nums; }
 
 /* Mobile-specific: prevent horizontal overflow */
-html, body { overflow-x: hidden; max-width: 100vw; }
 .card, .max-w-4xl { max-width: 100%; }
 
 /* Score input specifically: make sure it never exceeds container */
@@ -1405,7 +1412,7 @@ function PadelTournamentApp() {
     className: "court-grid-bg",
     style: {
       minHeight: '100vh',
-      paddingBottom: '80px'
+      paddingBottom: '120px'
     }
   }, /*#__PURE__*/React.createElement(Header, {
     onReset: tournament ? handleReset : null,
@@ -1734,6 +1741,31 @@ function SetupPhase(_ref5) {
       });
     });
   };
+  var addOnePlayer = function addOnePlayer() {
+    if (playerCount >= 32) return;
+    var newCount = playerCount + 1;
+    setPlayerCount(newCount);
+    setPlayerNames(function (prev) {
+      return [].concat(_toConsumableArray(prev), ["Spieler ".concat(prev.length + 1)]);
+    });
+    setPlayerLevels(function (prev) {
+      return [].concat(_toConsumableArray(prev), [3]);
+    });
+  };
+  var removeOnePlayer = function removeOnePlayer(index) {
+    if (playerCount <= 4) return;
+    setPlayerCount(playerCount - 1);
+    setPlayerNames(function (prev) {
+      return prev.filter(function (_, idx) {
+        return idx !== index;
+      });
+    });
+    setPlayerLevels(function (prev) {
+      return prev.filter(function (_, idx) {
+        return idx !== index;
+      });
+    });
+  };
   var canStart = function canStart() {
     if (!mode || !subMode) return false;
     if (mode === 'fixed' && playerCount % 2 !== 0) return false;
@@ -1964,7 +1996,20 @@ function SetupPhase(_ref5) {
       },
       className: "input px-3 py-2 text-sm flex-1",
       placeholder: "Spieler ".concat(i + 1)
-    })), /*#__PURE__*/React.createElement("div", {
+    }), /*#__PURE__*/React.createElement("button", {
+      onClick: function onClick() {
+        return removeOnePlayer(i);
+      },
+      disabled: playerCount <= 4,
+      className: "btn-ghost p-2 rounded-lg flex-shrink-0",
+      style: {
+        color: playerCount <= 4 ? 'var(--border)' : 'var(--danger)',
+        cursor: playerCount <= 4 ? 'not-allowed' : 'pointer'
+      },
+      title: playerCount <= 4 ? 'Mindestens 4 Spieler' : 'Spieler entfernen'
+    }, /*#__PURE__*/React.createElement(Trash2, {
+      size: 14
+    }))), /*#__PURE__*/React.createElement("div", {
       className: "flex items-center gap-2 pl-10"
     }, /*#__PURE__*/React.createElement("span", {
       className: "text-xs uppercase tracking-wider",
@@ -1978,7 +2023,21 @@ function SetupPhase(_ref5) {
         return updatePlayerLevel(i, lvl);
       }
     })));
-  })), /*#__PURE__*/React.createElement("div", {
+  })), /*#__PURE__*/React.createElement("button", {
+    onClick: addOnePlayer,
+    disabled: playerCount >= 32,
+    className: "btn-secondary w-full py-3 rounded-lg flex items-center justify-center gap-2 text-sm",
+    style: {
+      opacity: playerCount >= 32 ? 0.4 : 1,
+      cursor: playerCount >= 32 ? 'not-allowed' : 'pointer'
+    }
+  }, /*#__PURE__*/React.createElement(UserPlus, {
+    size: 16
+  }), " Spieler hinzuf\xFCgen", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: 'var(--text-dim)'
+    }
+  }, "(", playerCount, " / 32)")), /*#__PURE__*/React.createElement("div", {
     className: "pt-4 flex justify-between"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: function onClick() {
