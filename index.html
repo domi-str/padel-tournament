@@ -1372,6 +1372,7 @@ var generateMexicanoRound = function generateMexicanoRound(players, courts, rest
 // Suggests 4 players for the next match on a given court
 // Considers: matches played (asc), time since last match (desc), team diversity, level
 var suggestChampionsLeagueMatch = function suggestChampionsLeagueMatch(tournament, occupiedPlayerIds) {
+  var rerollSeed = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 0;
   // Only present, active players who aren't currently playing on another court
   var eligible = tournament.players.filter(function (p) {
     return p.active !== false && p.present === true && !occupiedPlayerIds.has(p.id);
@@ -1386,9 +1387,16 @@ var suggestChampionsLeagueMatch = function suggestChampionsLeagueMatch(tournamen
       player: p,
       played: 0,
       lastPlayed: 0,
-      partners: {}
+      partners: {},
+      opponents: {}
     };
   });
+  // Global tracking (also count matches with players who are NOT eligible right now, but were partners/opponents)
+  var globalPartners = {}; // key "id1|id2" (sorted) -> count
+  var globalOpponents = {}; // key "id1|id2" (sorted) -> count
+  var pairKey = function pairKey(a, b) {
+    return a < b ? "".concat(a, "|").concat(b) : "".concat(b, "|").concat(a);
+  };
   (tournament.matches || []).forEach(function (m) {
     if (!m.finishedAt) return;
     [].concat(_toConsumableArray(m.teamA || []), _toConsumableArray(m.teamB || [])).forEach(function (pid) {
@@ -1397,81 +1405,204 @@ var suggestChampionsLeagueMatch = function suggestChampionsLeagueMatch(tournamen
         stats[pid].lastPlayed = Math.max(stats[pid].lastPlayed, m.finishedAt);
       }
     });
-    // Track partners
+    // Track partners (same team)
     [m.teamA, m.teamB].forEach(function (team) {
       if (!team || team.length !== 2) return;
       var _team = _slicedToArray(team, 2),
         a = _team[0],
         b = _team[1];
+      globalPartners[pairKey(a, b)] = (globalPartners[pairKey(a, b)] || 0) + 1;
       if (stats[a]) stats[a].partners[b] = (stats[a].partners[b] || 0) + 1;
       if (stats[b]) stats[b].partners[a] = (stats[b].partners[a] || 0) + 1;
     });
+    // Track opponents (different teams)
+    if (m.teamA && m.teamB) {
+      m.teamA.forEach(function (a) {
+        m.teamB.forEach(function (b) {
+          globalOpponents[pairKey(a, b)] = (globalOpponents[pairKey(a, b)] || 0) + 1;
+          if (stats[a]) stats[a].opponents[b] = (stats[a].opponents[b] || 0) + 1;
+          if (stats[b]) stats[b].opponents[a] = (stats[b].opponents[a] || 0) + 1;
+        });
+      });
+    }
   });
 
-  // Sort: least played first, then longest wait, then random
-  var sorted = Object.values(stats).sort(function (x, y) {
-    if (x.played !== y.played) return x.played - y.played;
-    if (x.lastPlayed !== y.lastPlayed) return x.lastPlayed - y.lastPlayed;
-    return Math.random() - 0.5;
-  });
-  var four = sorted.slice(0, 4).map(function (s) {
-    return s.player;
-  });
+  // Determine the minimum play count among eligible players
+  var minPlayed = Math.min.apply(Math, _toConsumableArray(Object.values(stats).map(function (s) {
+    return s.played;
+  })));
 
-  // Build teams based on level strategy
-  var teamA, teamB;
-  var strategy = tournament.levelStrategy || 'none';
-  if (strategy === 'balanced_teams' || strategy === 'similar_opponents') {
-    var t = balancedTeams(four);
-    teamA = t.teamA;
-    teamB = t.teamB;
-  } else {
-    // No level strategy: try to avoid recent pairings
-    // Score all 3 possible team splits, pick one with fewest past pairings
-    var splits = [{
-      a: [four[0].id, four[1].id],
-      b: [four[2].id, four[3].id]
-    }, {
-      a: [four[0].id, four[2].id],
-      b: [four[1].id, four[3].id]
-    }, {
-      a: [four[0].id, four[3].id],
-      b: [four[1].id, four[2].id]
-    }];
-    var scored = splits.map(function (s) {
-      var _stats$s$a$, _stats$s$b$;
-      var p1 = ((_stats$s$a$ = stats[s.a[0]]) === null || _stats$s$a$ === void 0 ? void 0 : _stats$s$a$.partners[s.a[1]]) || 0;
-      var p2 = ((_stats$s$b$ = stats[s.b[0]]) === null || _stats$s$b$ === void 0 ? void 0 : _stats$s$b$.partners[s.b[1]]) || 0;
-      return {
-        split: s,
-        score: p1 + p2
-      };
+  // "Priority pool" = players with play count within 1 of the min (fair rotation)
+  // If pool < 4, expand to within 2
+  var priorityPool = Object.values(stats).filter(function (s) {
+    return s.played <= minPlayed + 1;
+  });
+  if (priorityPool.length < 4) {
+    priorityPool = Object.values(stats).filter(function (s) {
+      return s.played <= minPlayed + 2;
     });
-    scored.sort(function (x, y) {
-      return x.score - y.score || Math.random() - 0.5;
-    });
-    teamA = scored[0].split.a;
-    teamB = scored[0].split.b;
   }
+  if (priorityPool.length < 4) {
+    priorityPool = Object.values(stats); // all eligible
+  }
+
+  // Generate all possible 4-combinations from priority pool
+  var priorityIds = priorityPool.map(function (s) {
+    return s.player.id;
+  });
+  var combinations = [];
+  for (var i = 0; i < priorityIds.length - 3; i++) {
+    for (var j = i + 1; j < priorityIds.length - 2; j++) {
+      for (var k = j + 1; k < priorityIds.length - 1; k++) {
+        for (var l = k + 1; l < priorityIds.length; l++) {
+          combinations.push([priorityIds[i], priorityIds[j], priorityIds[k], priorityIds[l]]);
+        }
+      }
+    }
+  }
+
+  // For each combination, evaluate all 3 possible team splits and pick the best split.
+  // Then score the whole combination.
+  var strategy = tournament.levelStrategy || 'none';
+  var evaluateCombination = function evaluateCombination(four) {
+    var players = four.map(function (id) {
+      return stats[id].player;
+    });
+    // Play statistics of the four
+    var totalPlayed = four.reduce(function (s, id) {
+      return s + stats[id].played;
+    }, 0);
+    var totalWaitMs = four.reduce(function (s, id) {
+      var last = stats[id].lastPlayed;
+      return s + (last ? now - last : now - (tournament.startedAt || now) + 3600000); // "never played" = penalty of +1h wait
+    }, 0);
+
+    // Try all 3 splits
+    var splits;
+    if (strategy === 'balanced_teams' || strategy === 'similar_opponents') {
+      var t = balancedTeams(players);
+      splits = [{
+        a: t.teamA,
+        b: t.teamB
+      }];
+    } else {
+      splits = [{
+        a: [four[0], four[1]],
+        b: [four[2], four[3]]
+      }, {
+        a: [four[0], four[2]],
+        b: [four[1], four[3]]
+      }, {
+        a: [four[0], four[3]],
+        b: [four[1], four[2]]
+      }];
+    }
+
+    // Score each split by rotation quality
+    var scoredSplits = splits.map(function (split) {
+      // Partner repetition: how often have teammates been paired before?
+      var partnerCount = (globalPartners[pairKey(split.a[0], split.a[1])] || 0) + (globalPartners[pairKey(split.b[0], split.b[1])] || 0);
+      // Opponent repetition: how often have opponents faced each other before?
+      var oppCount = (globalOpponents[pairKey(split.a[0], split.b[0])] || 0) + (globalOpponents[pairKey(split.a[0], split.b[1])] || 0) + (globalOpponents[pairKey(split.a[1], split.b[0])] || 0) + (globalOpponents[pairKey(split.a[1], split.b[1])] || 0);
+      return _objectSpread(_objectSpread({}, split), {}, {
+        partnerCount: partnerCount,
+        oppCount: oppCount
+      });
+    });
+    // Best split minimizes partner + opponent repetitions
+    scoredSplits.sort(function (x, y) {
+      var scoreX = x.partnerCount * 3 + x.oppCount * 1; // partner-repetition is more painful
+      var scoreY = y.partnerCount * 3 + y.oppCount * 1;
+      return scoreX - scoreY;
+    });
+    var bestSplit = scoredSplits[0];
+
+    // Combination-level score: LOWER = BETTER
+    // Weights (tuned to prioritize rotation early, fairness late)
+    var playedScore = totalPlayed * 100; // heavy penalty for players who already played a lot
+    var waitScore = -Math.min(totalWaitMs / 60000, 240); // reward long waits (cap at 4h)
+    var partnerRepScore = bestSplit.partnerCount * 50; // strong penalty for repeated partners
+    var opponentRepScore = bestSplit.oppCount * 15; // moderate penalty for repeated opponents
+    var randomNoise = (Math.random() + rerollSeed * 0.7) * 30; // 0-30 point random jitter per reroll
+
+    var totalScore = playedScore + waitScore + partnerRepScore + opponentRepScore + randomNoise;
+    return {
+      four: four,
+      split: bestSplit,
+      score: totalScore
+    };
+  };
+  var scored = combinations.map(evaluateCombination);
+  scored.sort(function (x, y) {
+    return x.score - y.score;
+  });
+
+  // Pick the winner (with slight top-K randomization if reroll)
+  var winner;
+  if (rerollSeed > 0 && scored.length > 3) {
+    // On reroll: pick randomly from top 5 candidates (weighted toward top)
+    var topK = scored.slice(0, Math.min(5, scored.length));
+    // Weighted random: index 0 has weight 5, index 1 has weight 3, index 2 has weight 2, rest weight 1
+    var weights = [5, 3, 2, 1, 1].slice(0, topK.length);
+    var totalWeight = weights.reduce(function (s, w) {
+      return s + w;
+    }, 0);
+    var r = Math.random() * totalWeight;
+    var idx = 0;
+    for (var _i3 = 0; _i3 < weights.length; _i3++) {
+      r -= weights[_i3];
+      if (r <= 0) {
+        idx = _i3;
+        break;
+      }
+    }
+    winner = topK[idx];
+  } else {
+    winner = scored[0];
+  }
+  var teamA = winner.split.a;
+  var teamB = winner.split.b;
 
   // Attach per-player context for the suggestion modal
   var context = {};
-  four.forEach(function (p) {
-    var s = stats[p.id];
+  winner.four.forEach(function (id) {
+    var s = stats[id];
     var waitMs = s.lastPlayed ? now - s.lastPlayed : null;
-    context[p.id] = {
+    context[id] = {
       played: s.played,
       waitMs: waitMs
     };
   });
+
+  // Rotation quality info: how many times these exact partner/opponent combos existed before
+  var rotationInfo = {
+    partnerRepeats: winner.split.partnerCount,
+    // combined repeats for both teams
+    opponentRepeats: winner.split.oppCount,
+    // combined repeats across the 4 opponent pairs
+    poolSize: eligible.length,
+    // how many eligible players in total
+    forced: eligible.length <= 4 // only 4 available → no real choice
+  };
   return {
     teamA: teamA,
     teamB: teamB,
-    candidates: four.map(function (p) {
-      return p.id;
-    }),
-    context: context
+    candidates: winner.four,
+    context: context,
+    rotationInfo: rotationInfo
   };
+};
+
+// Preview: what would the suggestion look like if some currently-playing players were also available?
+// Returns null if no improvement is possible.
+var previewNextMatchAfterCourtEnds = function previewNextMatchAfterCourtEnds(tournament, occupiedPlayerIds, freeingCourt) {
+  if (!freeingCourt || !freeingCourt.match) return null;
+  var freedIds = [].concat(_toConsumableArray(freeingCourt.match.teamA || []), _toConsumableArray(freeingCourt.match.teamB || []));
+  var newOccupied = new Set(occupiedPlayerIds);
+  freedIds.forEach(function (id) {
+    return newOccupied.delete(id);
+  });
+  return suggestChampionsLeagueMatch(tournament, newOccupied, 0);
 };
 
 // ============= MATCH FORMAT VALIDATION =============
@@ -3696,10 +3827,14 @@ function ChampionsLeaguePhase(_ref0) {
     _useState84 = _slicedToArray(_useState83, 2),
     bulkFillPending = _useState84[0],
     setBulkFillPending = _useState84[1]; // { proposals: [{courtId, teamA, teamB, context}] }
-  var _useState85 = useState(Date.now()),
+  var _useState85 = useState(0),
     _useState86 = _slicedToArray(_useState85, 2),
-    now = _useState86[0],
-    setNow = _useState86[1];
+    rerollCount = _useState86[0],
+    setRerollCount = _useState86[1]; // increments to force rotation on each reroll
+  var _useState87 = useState(Date.now()),
+    _useState88 = _slicedToArray(_useState87, 2),
+    now = _useState88[0],
+    setNow = _useState88[1];
 
   // Timer tick
   useEffect(function () {
@@ -3765,7 +3900,7 @@ function ChampionsLeaguePhase(_ref0) {
     });
   };
   var requestNextMatch = function requestNextMatch(courtId) {
-    var suggestion = suggestChampionsLeagueMatch(tournament, occupiedPlayerIds);
+    var suggestion = suggestChampionsLeagueMatch(tournament, occupiedPlayerIds, 0);
     if (!suggestion) {
       alert('Nicht genug anwesende Spieler verfügbar (mind. 4 nötig, die nicht gerade spielen).');
       return;
@@ -3773,8 +3908,10 @@ function ChampionsLeaguePhase(_ref0) {
     setPendingMatch(_objectSpread({
       courtId: courtId
     }, suggestion));
+    setRerollCount(0);
   };
   var fillAllCourts = function fillAllCourts() {
+    var rerollSeed = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
     var freeCourts = tournament.courts.filter(function (c) {
       return c.status === 'free';
     });
@@ -3786,13 +3923,14 @@ function ChampionsLeaguePhase(_ref0) {
     try {
       for (_iterator.s(); !(_step = _iterator.n()).done;) {
         var court = _step.value;
-        var suggestion = suggestChampionsLeagueMatch(tournament, busyIds);
+        var suggestion = suggestChampionsLeagueMatch(tournament, busyIds, rerollSeed);
         if (!suggestion) break; // ran out of players
         proposals.push({
           courtId: court.id,
           teamA: suggestion.teamA,
           teamB: suggestion.teamB,
-          context: suggestion.context || {}
+          context: suggestion.context || {},
+          rotationInfo: suggestion.rotationInfo || {}
         });
         // Reserve these players for next iteration
         [].concat(_toConsumableArray(suggestion.teamA), _toConsumableArray(suggestion.teamB)).forEach(function (id) {
@@ -3887,7 +4025,9 @@ function ChampionsLeaguePhase(_ref0) {
     });
   };
   var rerollBulkFill = function rerollBulkFill() {
-    fillAllCourts();
+    var newSeed = rerollCount + 1;
+    setRerollCount(newSeed);
+    fillAllCourts(newSeed);
   };
   var confirmMatch = function confirmMatch() {
     if (!pendingMatch) return;
@@ -3917,6 +4057,7 @@ function ChampionsLeaguePhase(_ref0) {
       });
     });
     setPendingMatch(null);
+    setRerollCount(0);
   };
   var swapPlayerInPending = function swapPlayerInPending(slotIdx, newPlayerId) {
     // slotIdx: 0-3 (teamA[0], teamA[1], teamB[0], teamB[1])
@@ -3932,7 +4073,9 @@ function ChampionsLeaguePhase(_ref0) {
   };
   var rerollMatch = function rerollMatch() {
     if (!pendingMatch) return;
-    var suggestion = suggestChampionsLeagueMatch(tournament, occupiedPlayerIds);
+    var newSeed = rerollCount + 1;
+    setRerollCount(newSeed);
+    var suggestion = suggestChampionsLeagueMatch(tournament, occupiedPlayerIds, newSeed);
     if (suggestion) setPendingMatch(_objectSpread({
       courtId: pendingMatch.courtId
     }, suggestion));
@@ -4225,30 +4368,30 @@ function CLCourtCard(_ref1) {
     onRequestMatch = _ref1.onRequestMatch,
     onSubmitScore = _ref1.onSubmitScore,
     onCancel = _ref1.onCancel;
-  var _useState87 = useState(''),
-    _useState88 = _slicedToArray(_useState87, 2),
-    scoreA = _useState88[0],
-    setScoreA = _useState88[1];
   var _useState89 = useState(''),
     _useState90 = _slicedToArray(_useState89, 2),
-    scoreB = _useState90[0],
-    setScoreB = _useState90[1];
+    scoreA = _useState90[0],
+    setScoreA = _useState90[1];
   var _useState91 = useState(''),
     _useState92 = _slicedToArray(_useState91, 2),
-    tiebreakA = _useState92[0],
-    setTiebreakA = _useState92[1];
+    scoreB = _useState92[0],
+    setScoreB = _useState92[1];
   var _useState93 = useState(''),
     _useState94 = _slicedToArray(_useState93, 2),
-    tiebreakB = _useState94[0],
-    setTiebreakB = _useState94[1];
+    tiebreakA = _useState94[0],
+    setTiebreakA = _useState94[1];
   var _useState95 = useState(''),
     _useState96 = _slicedToArray(_useState95, 2),
-    validationMsg = _useState96[0],
-    setValidationMsg = _useState96[1];
-  var _useState97 = useState(Date.now()),
+    tiebreakB = _useState96[0],
+    setTiebreakB = _useState96[1];
+  var _useState97 = useState(''),
     _useState98 = _slicedToArray(_useState97, 2),
-    now = _useState98[0],
-    setNow = _useState98[1];
+    validationMsg = _useState98[0],
+    setValidationMsg = _useState98[1];
+  var _useState99 = useState(Date.now()),
+    _useState100 = _slicedToArray(_useState99, 2),
+    now = _useState100[0],
+    setNow = _useState100[1];
   useEffect(function () {
     if (court.status !== 'running') return;
     var iv = setInterval(function () {
@@ -4491,7 +4634,7 @@ function CLCourtCard(_ref1) {
 
 // ============= MATCH SUGGESTION MODAL =============
 function MatchSuggestionModal(_ref10) {
-  var _getPlayer;
+  var _previewsAvailable$0$, _previewsAvailable$0$2, _getPlayer3;
   var pendingMatch = _ref10.pendingMatch,
     tournament = _ref10.tournament,
     occupiedPlayerIds = _ref10.occupiedPlayerIds,
@@ -4499,10 +4642,10 @@ function MatchSuggestionModal(_ref10) {
     onCancel = _ref10.onCancel,
     onSwap = _ref10.onSwap,
     onReroll = _ref10.onReroll;
-  var _useState99 = useState(null),
-    _useState100 = _slicedToArray(_useState99, 2),
-    swapSlot = _useState100[0],
-    setSwapSlot = _useState100[1]; // 0-3 or null
+  var _useState101 = useState(null),
+    _useState102 = _slicedToArray(_useState101, 2),
+    swapSlot = _useState102[0],
+    setSwapSlot = _useState102[1]; // 0-3 or null
   var getPlayer = function getPlayer(pid) {
     return tournament.players.find(function (p) {
       return p.id === pid;
@@ -4566,6 +4709,48 @@ function MatchSuggestionModal(_ref10) {
   var courtIdx = tournament.courts.findIndex(function (c) {
     return c.id === pendingMatch.courtId;
   });
+
+  // Rotation warning: check if this match has repetitions or forced pool
+  var rot = pendingMatch.rotationInfo || {};
+  // Show warning only when there's a REAL problem:
+  // - Actual repetitions occurred (partner or opponent), OR
+  // - Player pool is forced AND we have match history (indicating rotation matters)
+  var hasHistory = (tournament.matches || []).some(function (m) {
+    return m.finishedAt;
+  });
+  var hasWarning = rot.partnerRepeats > 0 || rot.opponentRepeats > 1 || rot.forced && hasHistory;
+
+  // Preview: what would happen if we wait for another running court to end?
+  var _useState103 = useState(false),
+    _useState104 = _slicedToArray(_useState103, 2),
+    showPreview = _useState104[0],
+    setShowPreview = _useState104[1];
+  var otherRunningCourts = tournament.courts.filter(function (c) {
+    return c.status === 'running' && c.id !== pendingMatch.courtId;
+  });
+  var previewsAvailable = useMemo(function () {
+    if (!hasWarning || otherRunningCourts.length === 0) return [];
+    return otherRunningCourts.map(function (rc) {
+      var _preview$rotationInfo, _preview$rotationInfo2;
+      var preview = previewNextMatchAfterCourtEnds(tournament, occupiedPlayerIds, rc);
+      if (!preview) return null;
+      var idx = tournament.courts.findIndex(function (c) {
+        return c.id === rc.id;
+      });
+      var improvement = (rot.partnerRepeats || 0) + (rot.opponentRepeats || 0) * 0.3 - ((((_preview$rotationInfo = preview.rotationInfo) === null || _preview$rotationInfo === void 0 ? void 0 : _preview$rotationInfo.partnerRepeats) || 0) + (((_preview$rotationInfo2 = preview.rotationInfo) === null || _preview$rotationInfo2 === void 0 ? void 0 : _preview$rotationInfo2.opponentRepeats) || 0) * 0.3);
+      return {
+        court: rc,
+        courtIdx: idx,
+        preview: preview,
+        improvement: improvement
+      };
+    }).filter(function (x) {
+      return x && x.improvement > 0.5;
+    }).sort(function (a, b) {
+      return b.improvement - a.improvement;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingMatch]);
   return /*#__PURE__*/React.createElement("div", {
     style: {
       position: 'fixed',
@@ -4605,12 +4790,79 @@ function MatchSuggestionModal(_ref10) {
     size: 16
   }))), /*#__PURE__*/React.createElement("div", {
     className: "p-5 space-y-4"
+  }, hasWarning && /*#__PURE__*/React.createElement("div", {
+    className: "card p-3 slide-in",
+    style: {
+      background: 'rgba(255, 184, 77, 0.1)',
+      border: '1px solid var(--warning)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-start gap-2"
+  }, /*#__PURE__*/React.createElement(AlertCircle, {
+    size: 16,
+    color: "var(--warning)",
+    style: {
+      flexShrink: 0,
+      marginTop: 2
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "flex-1 min-w-0"
   }, /*#__PURE__*/React.createElement("p", {
+    className: "text-xs font-semibold",
+    style: {
+      color: 'var(--warning)'
+    }
+  }, "Wiederholung erkannt"), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs mt-1",
+    style: {
+      color: 'var(--text)'
+    }
+  }, rot.forced ? "Nur ".concat(rot.poolSize, " Spieler verf\xFCgbar \u2014 keine Auswahl. ") : '', rot.partnerRepeats > 0 && "Diese Partner-Kombination gab es schon ".concat(rot.partnerRepeats, "\xD7 (in dieser Form). "), rot.opponentRepeats > 0 && "Diese Gegner sind ".concat(rot.opponentRepeats, "\xD7 zuvor aufeinandergetroffen.")), previewsAvailable.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("p", {
+    className: "text-xs mt-2",
+    style: {
+      color: 'var(--warning)'
+    }
+  }, "\uD83D\uDCA1 Empfehlung: Warten bis Court ", previewsAvailable[0].courtIdx + 1, " fertig ist \u2014 dann bessere Rotation m\xF6glich."), /*#__PURE__*/React.createElement("button", {
+    onClick: function onClick() {
+      return setShowPreview(!showPreview);
+    },
+    className: "btn-ghost mt-2 px-2 py-1 rounded text-xs",
+    style: {
+      color: 'var(--warning)'
+    }
+  }, showPreview ? 'Vorschau ausblenden' : "Vorschau: Nach Court ".concat(previewsAvailable[0].courtIdx + 1)), showPreview && /*#__PURE__*/React.createElement("div", {
+    className: "card p-2 mt-2",
+    style: {
+      background: 'var(--bg-card)',
+      border: '1px solid var(--border)'
+    }
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "text-xs uppercase tracking-wider mb-1",
+    style: {
+      color: 'var(--text-dim)'
+    }
+  }, "Vorschau \u2014 Match nach Court ", previewsAvailable[0].courtIdx + 1), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs",
+    style: {
+      color: 'var(--text)'
+    }
+  }, /*#__PURE__*/React.createElement("strong", null, previewsAvailable[0].preview.teamA.map(function (id) {
+    var _getPlayer;
+    return (_getPlayer = getPlayer(id)) === null || _getPlayer === void 0 ? void 0 : _getPlayer.name;
+  }).join(' & ')), ' vs ', /*#__PURE__*/React.createElement("strong", null, previewsAvailable[0].preview.teamB.map(function (id) {
+    var _getPlayer2;
+    return (_getPlayer2 = getPlayer(id)) === null || _getPlayer2 === void 0 ? void 0 : _getPlayer2.name;
+  }).join(' & '))), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs mt-1",
+    style: {
+      color: 'var(--text-dim)'
+    }
+  }, "Partner-Wdh: ", ((_previewsAvailable$0$ = previewsAvailable[0].preview.rotationInfo) === null || _previewsAvailable$0$ === void 0 ? void 0 : _previewsAvailable$0$.partnerRepeats) || 0, ", Gegner-Wdh: ", ((_previewsAvailable$0$2 = previewsAvailable[0].preview.rotationInfo) === null || _previewsAvailable$0$2 === void 0 ? void 0 : _previewsAvailable$0$2.opponentRepeats) || 0)))))), /*#__PURE__*/React.createElement("p", {
     className: "text-xs",
     style: {
       color: 'var(--text-dim)'
     }
-  }, swapSlot === null ? 'Tippe auf einen Spieler unten, um ihn zu tauschen. Oder wähle direkt aus der Warteliste.' : "Ersetze ".concat((_getPlayer = getPlayer(currentFour[swapSlot])) === null || _getPlayer === void 0 ? void 0 : _getPlayer.name, " durch einen wartenden Spieler:")), /*#__PURE__*/React.createElement("div", {
+  }, swapSlot === null ? 'Tippe auf einen Spieler unten, um ihn zu tauschen. Oder wähle direkt aus der Warteliste.' : "Ersetze ".concat((_getPlayer3 = getPlayer(currentFour[swapSlot])) === null || _getPlayer3 === void 0 ? void 0 : _getPlayer3.name, " durch einen wartenden Spieler:")), /*#__PURE__*/React.createElement("div", {
     className: "grid grid-cols-[1fr_auto_1fr] gap-3 items-center"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("p", {
     className: "text-xs uppercase tracking-wider text-center mb-2",
@@ -4789,7 +5041,7 @@ function PendingPlayerCard(_ref11) {
 
 // ============= BULK FILL MODAL =============
 function BulkFillModal(_ref12) {
-  var _getPlayer2, _bulkFillPending$prop;
+  var _getPlayer4, _bulkFillPending$prop;
   var bulkFillPending = _ref12.bulkFillPending,
     tournament = _ref12.tournament,
     occupiedPlayerIds = _ref12.occupiedPlayerIds,
@@ -4797,10 +5049,10 @@ function BulkFillModal(_ref12) {
     onCancel = _ref12.onCancel,
     onSwap = _ref12.onSwap,
     onReroll = _ref12.onReroll;
-  var _useState101 = useState(null),
-    _useState102 = _slicedToArray(_useState101, 2),
-    swapTarget = _useState102[0],
-    setSwapTarget = _useState102[1]; // { courtId, slotIdx } or null
+  var _useState105 = useState(null),
+    _useState106 = _slicedToArray(_useState105, 2),
+    swapTarget = _useState106[0],
+    setSwapTarget = _useState106[1]; // { courtId, slotIdx } or null
   var getPlayer = function getPlayer(pid) {
     return tournament.players.find(function (p) {
       return p.id === pid;
@@ -4845,6 +5097,24 @@ function BulkFillModal(_ref12) {
   };
   var totalPlayers = bulkFillPending.proposals.length * 4;
   var totalWaiting = waitingCandidates.length;
+
+  // Compute overall rotation warnings across all proposals
+  var totalPartnerRepeats = bulkFillPending.proposals.reduce(function (s, p) {
+    var _p$rotationInfo;
+    return s + (((_p$rotationInfo = p.rotationInfo) === null || _p$rotationInfo === void 0 ? void 0 : _p$rotationInfo.partnerRepeats) || 0);
+  }, 0);
+  var totalOpponentRepeats = bulkFillPending.proposals.reduce(function (s, p) {
+    var _p$rotationInfo2;
+    return s + (((_p$rotationInfo2 = p.rotationInfo) === null || _p$rotationInfo2 === void 0 ? void 0 : _p$rotationInfo2.opponentRepeats) || 0);
+  }, 0);
+  var anyForced = bulkFillPending.proposals.some(function (p) {
+    var _p$rotationInfo3;
+    return (_p$rotationInfo3 = p.rotationInfo) === null || _p$rotationInfo3 === void 0 ? void 0 : _p$rotationInfo3.forced;
+  });
+  var hasHistory = (tournament.matches || []).some(function (m) {
+    return m.finishedAt;
+  });
+  var hasWarning = totalPartnerRepeats > 0 || totalOpponentRepeats > 2 || anyForced && hasHistory;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       position: 'fixed',
@@ -4888,16 +5158,49 @@ function BulkFillModal(_ref12) {
     size: 16
   }))), /*#__PURE__*/React.createElement("div", {
     className: "p-5 space-y-4"
+  }, hasWarning && /*#__PURE__*/React.createElement("div", {
+    className: "card p-3",
+    style: {
+      background: 'rgba(255, 184, 77, 0.1)',
+      border: '1px solid var(--warning)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-start gap-2"
+  }, /*#__PURE__*/React.createElement(AlertCircle, {
+    size: 16,
+    color: "var(--warning)",
+    style: {
+      flexShrink: 0,
+      marginTop: 2
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "flex-1 min-w-0"
   }, /*#__PURE__*/React.createElement("p", {
+    className: "text-xs font-semibold",
+    style: {
+      color: 'var(--warning)'
+    }
+  }, "Wiederholungen in den Vorschl\xE4gen"), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs mt-1",
+    style: {
+      color: 'var(--text)'
+    }
+  }, anyForced && "Zu wenige Spieler f\xFCr optimale Rotation. ", totalPartnerRepeats > 0 && "".concat(totalPartnerRepeats, "\xD7 wiederholte Partner-Paarung(en). "), totalOpponentRepeats > 0 && "".concat(totalOpponentRepeats, "\xD7 wiederholte Gegner-Paarung(en).")), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs mt-2",
+    style: {
+      color: 'var(--text-dim)'
+    }
+  }, "\uD83D\uDCA1 Tipp: \u201ENeue Vorschl\xE4ge\" ausprobieren, oder Spieler manuell tauschen.")))), /*#__PURE__*/React.createElement("p", {
     className: "text-xs",
     style: {
       color: 'var(--text-dim)'
     }
-  }, swapTarget === null ? "Vorschl\xE4ge f\xFCr ".concat(bulkFillPending.proposals.length, " Courts (").concat(totalPlayers, " Spieler). Tippe einen Spieler an, um zu tauschen.") : "Ersetze ".concat((_getPlayer2 = getPlayer((_bulkFillPending$prop = bulkFillPending.proposals.find(function (p) {
+  }, swapTarget === null ? "Vorschl\xE4ge f\xFCr ".concat(bulkFillPending.proposals.length, " Courts (").concat(totalPlayers, " Spieler). Tippe einen Spieler an, um zu tauschen.") : "Ersetze ".concat((_getPlayer4 = getPlayer((_bulkFillPending$prop = bulkFillPending.proposals.find(function (p) {
     return p.courtId === swapTarget.courtId;
-  })) === null || _bulkFillPending$prop === void 0 || (_bulkFillPending$prop = _bulkFillPending$prop[swapTarget.slotIdx < 2 ? 'teamA' : 'teamB']) === null || _bulkFillPending$prop === void 0 ? void 0 : _bulkFillPending$prop[swapTarget.slotIdx % 2])) === null || _getPlayer2 === void 0 ? void 0 : _getPlayer2.name, " durch:")), /*#__PURE__*/React.createElement("div", {
+  })) === null || _bulkFillPending$prop === void 0 || (_bulkFillPending$prop = _bulkFillPending$prop[swapTarget.slotIdx < 2 ? 'teamA' : 'teamB']) === null || _bulkFillPending$prop === void 0 ? void 0 : _bulkFillPending$prop[swapTarget.slotIdx % 2])) === null || _getPlayer4 === void 0 ? void 0 : _getPlayer4.name, " durch:")), /*#__PURE__*/React.createElement("div", {
     className: "space-y-3"
   }, bulkFillPending.proposals.map(function (proposal, courtProposalIdx) {
+    var _proposal$rotationInf, _proposal$rotationInf2, _proposal$rotationInf3, _proposal$rotationInf4;
     var courtIdx = tournament.courts.findIndex(function (c) {
       return c.id === proposal.courtId;
     });
@@ -4915,7 +5218,7 @@ function BulkFillModal(_ref12) {
       className: "card",
       style: {
         background: 'var(--bg-elevated)',
-        borderColor: 'var(--border)'
+        borderColor: ((_proposal$rotationInf = proposal.rotationInfo) === null || _proposal$rotationInf === void 0 ? void 0 : _proposal$rotationInf.partnerRepeats) > 0 || ((_proposal$rotationInf2 = proposal.rotationInfo) === null || _proposal$rotationInf2 === void 0 ? void 0 : _proposal$rotationInf2.opponentRepeats) > 1 ? 'var(--warning)' : 'var(--border)'
       }
     }, /*#__PURE__*/React.createElement("div", {
       className: "px-3 py-2 flex items-center gap-2",
@@ -4933,7 +5236,15 @@ function BulkFillModal(_ref12) {
       style: {
         color: 'var(--text-dim)'
       }
-    }, "Court ", courtIdx + 1)), /*#__PURE__*/React.createElement("div", {
+    }, "Court ", courtIdx + 1), (((_proposal$rotationInf3 = proposal.rotationInfo) === null || _proposal$rotationInf3 === void 0 ? void 0 : _proposal$rotationInf3.partnerRepeats) > 0 || ((_proposal$rotationInf4 = proposal.rotationInfo) === null || _proposal$rotationInf4 === void 0 ? void 0 : _proposal$rotationInf4.opponentRepeats) > 1) && /*#__PURE__*/React.createElement("span", {
+      className: "text-xs ml-auto flex items-center gap-1",
+      style: {
+        color: 'var(--warning)'
+      },
+      title: "".concat(proposal.rotationInfo.partnerRepeats || 0, "\xD7 Partner-Wdh, ").concat(proposal.rotationInfo.opponentRepeats || 0, "\xD7 Gegner-Wdh")
+    }, /*#__PURE__*/React.createElement(AlertCircle, {
+      size: 10
+    }), " Wdh.")), /*#__PURE__*/React.createElement("div", {
       className: "p-3"
     }, /*#__PURE__*/React.createElement("div", {
       className: "grid grid-cols-[1fr_auto_1fr] gap-2 items-center"
@@ -5154,10 +5465,10 @@ function BulkFillModal(_ref12) {
 function CLStandings(_ref13) {
   var tournament = _ref13.tournament;
   var standings = computeChampionsLeagueStandings(tournament);
-  var _useState103 = useState(null),
-    _useState104 = _slicedToArray(_useState103, 2),
-    detailPlayerId = _useState104[0],
-    setDetailPlayerId = _useState104[1];
+  var _useState107 = useState(null),
+    _useState108 = _slicedToArray(_useState107, 2),
+    detailPlayerId = _useState108[0],
+    setDetailPlayerId = _useState108[1];
   var detailPlayer = detailPlayerId ? standings.find(function (s) {
     return s.id === detailPlayerId;
   }) : null;
@@ -5485,10 +5796,10 @@ function PlayerDetailModal(_ref14) {
 // ============= CL HISTORY =============
 function CLHistoryView(_ref15) {
   var tournament = _ref15.tournament;
-  var _useState105 = useState(null),
-    _useState106 = _slicedToArray(_useState105, 2),
-    filterPlayerId = _useState106[0],
-    setFilterPlayerId = _useState106[1];
+  var _useState109 = useState(null),
+    _useState110 = _slicedToArray(_useState109, 2),
+    filterPlayerId = _useState110[0],
+    setFilterPlayerId = _useState110[1];
   var allFinished = (tournament.matches || []).filter(function (m) {
     return m.finishedAt;
   }).sort(function (a, b) {
@@ -5600,10 +5911,10 @@ function CLHistoryView(_ref15) {
 // ============= ROOM CODE BANNER =============
 function RoomCodeBanner(_ref16) {
   var tournament = _ref16.tournament;
-  var _useState107 = useState(false),
-    _useState108 = _slicedToArray(_useState107, 2),
-    copied = _useState108[0],
-    setCopied = _useState108[1];
+  var _useState111 = useState(false),
+    _useState112 = _slicedToArray(_useState111, 2),
+    copied = _useState112[0],
+    setCopied = _useState112[1];
   var code = tournament.roomCode;
   var joinUrl = "".concat(window.location.origin).concat(window.location.pathname, "?join=").concat(code);
   var handleCopyCode = /*#__PURE__*/function () {
@@ -5843,14 +6154,14 @@ function PlayingPhase(_ref18) {
     setTournament = _ref18.setTournament,
     onFinish = _ref18.onFinish,
     onPause = _ref18.onPause;
-  var _useState109 = useState('matches'),
-    _useState110 = _slicedToArray(_useState109, 2),
-    view = _useState110[0],
-    setView = _useState110[1];
-  var _useState111 = useState(false),
-    _useState112 = _slicedToArray(_useState111, 2),
-    showPlayerMgmt = _useState112[0],
-    setShowPlayerMgmt = _useState112[1];
+  var _useState113 = useState('matches'),
+    _useState114 = _slicedToArray(_useState113, 2),
+    view = _useState114[0],
+    setView = _useState114[1];
+  var _useState115 = useState(false),
+    _useState116 = _slicedToArray(_useState115, 2),
+    showPlayerMgmt = _useState116[0],
+    setShowPlayerMgmt = _useState116[1];
   var currentRoundIdx = tournament.currentRound - 1;
   var currentRound = tournament.schedule[currentRoundIdx];
   var allComplete = currentRound === null || currentRound === void 0 ? void 0 : currentRound.matches.every(function (m) {
@@ -6070,18 +6381,18 @@ function MatchCard(_ref19) {
     result = _ref19.result,
     onSubmit = _ref19.onSubmit,
     onClear = _ref19.onClear;
-  var _useState113 = useState(false),
-    _useState114 = _slicedToArray(_useState113, 2),
-    editing = _useState114[0],
-    setEditing = _useState114[1];
-  var _useState115 = useState((_result$scoreA = result === null || result === void 0 ? void 0 : result.scoreA) !== null && _result$scoreA !== void 0 ? _result$scoreA : ''),
-    _useState116 = _slicedToArray(_useState115, 2),
-    scoreA = _useState116[0],
-    setScoreA = _useState116[1];
-  var _useState117 = useState((_result$scoreB = result === null || result === void 0 ? void 0 : result.scoreB) !== null && _result$scoreB !== void 0 ? _result$scoreB : ''),
+  var _useState117 = useState(false),
     _useState118 = _slicedToArray(_useState117, 2),
-    scoreB = _useState118[0],
-    setScoreB = _useState118[1];
+    editing = _useState118[0],
+    setEditing = _useState118[1];
+  var _useState119 = useState((_result$scoreA = result === null || result === void 0 ? void 0 : result.scoreA) !== null && _result$scoreA !== void 0 ? _result$scoreA : ''),
+    _useState120 = _slicedToArray(_useState119, 2),
+    scoreA = _useState120[0],
+    setScoreA = _useState120[1];
+  var _useState121 = useState((_result$scoreB = result === null || result === void 0 ? void 0 : result.scoreB) !== null && _result$scoreB !== void 0 ? _result$scoreB : ''),
+    _useState122 = _slicedToArray(_useState121, 2),
+    scoreB = _useState122[0],
+    setScoreB = _useState122[1];
   useEffect(function () {
     var _result$scoreA2, _result$scoreB2;
     setScoreA((_result$scoreA2 = result === null || result === void 0 ? void 0 : result.scoreA) !== null && _result$scoreA2 !== void 0 ? _result$scoreA2 : '');
@@ -6497,22 +6808,22 @@ function PlayerManagementModal(_ref22) {
     setTournament = _ref22.setTournament,
     onClose = _ref22.onClose,
     isChampionsLeague = _ref22.isChampionsLeague;
-  var _useState119 = useState({}),
-    _useState120 = _slicedToArray(_useState119, 2),
-    editingIds = _useState120[0],
-    setEditingIds = _useState120[1];
-  var _useState121 = useState(''),
-    _useState122 = _slicedToArray(_useState121, 2),
-    newPlayerName = _useState122[0],
-    setNewPlayerName = _useState122[1];
-  var _useState123 = useState(3),
+  var _useState123 = useState({}),
     _useState124 = _slicedToArray(_useState123, 2),
-    newPlayerLevel = _useState124[0],
-    setNewPlayerLevel = _useState124[1];
-  var _useState125 = useState(null),
+    editingIds = _useState124[0],
+    setEditingIds = _useState124[1];
+  var _useState125 = useState(''),
     _useState126 = _slicedToArray(_useState125, 2),
-    showRemoveDialog = _useState126[0],
-    setShowRemoveDialog = _useState126[1];
+    newPlayerName = _useState126[0],
+    setNewPlayerName = _useState126[1];
+  var _useState127 = useState(3),
+    _useState128 = _slicedToArray(_useState127, 2),
+    newPlayerLevel = _useState128[0],
+    setNewPlayerLevel = _useState128[1];
+  var _useState129 = useState(null),
+    _useState130 = _slicedToArray(_useState129, 2),
+    showRemoveDialog = _useState130[0],
+    setShowRemoveDialog = _useState130[1];
   var playerHasResults = function playerHasResults(playerId) {
     var _tournament$schedule;
     if (isChampionsLeague) {
