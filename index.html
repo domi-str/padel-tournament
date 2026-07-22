@@ -1432,6 +1432,14 @@ var suggestChampionsLeagueMatch = function suggestChampionsLeagueMatch(tournamen
     return s.played;
   })));
 
+  // Compute partner diversity: how many DIFFERENT partners has each eligible player experienced?
+  // This is key for late joiners: they've played with few different people, so they need "new" partners.
+  // We consider ALL players (not just eligible) because a late joiner might have played with someone who's currently on court.
+  Object.values(stats).forEach(function (s) {
+    s.uniquePartners = Object.keys(s.partners).length;
+    s.uniqueOpponents = Object.keys(s.opponents).length;
+  });
+
   // "Priority pool" = players with play count within 1 of the min (fair rotation)
   // If pool < 4, expand to within 2
   var priorityPool = Object.values(stats).filter(function (s) {
@@ -1501,31 +1509,65 @@ var suggestChampionsLeagueMatch = function suggestChampionsLeagueMatch(tournamen
     // Score each split by rotation quality
     var scoredSplits = splits.map(function (split) {
       // Partner repetition: how often have teammates been paired before?
-      var partnerCount = (globalPartners[pairKey(split.a[0], split.a[1])] || 0) + (globalPartners[pairKey(split.b[0], split.b[1])] || 0);
+      var partnerCountA = globalPartners[pairKey(split.a[0], split.a[1])] || 0;
+      var partnerCountB = globalPartners[pairKey(split.b[0], split.b[1])] || 0;
+      var partnerCount = partnerCountA + partnerCountB;
       // Opponent repetition: how often have opponents faced each other before?
       var oppCount = (globalOpponents[pairKey(split.a[0], split.b[0])] || 0) + (globalOpponents[pairKey(split.a[0], split.b[1])] || 0) + (globalOpponents[pairKey(split.a[1], split.b[0])] || 0) + (globalOpponents[pairKey(split.a[1], split.b[1])] || 0);
+
+      // === DIVERSITY BONUS: reward NEW partnerships and new opponent encounters ===
+      // For each pair, check if this would be a NEW combination (partnerCount === 0)
+      // Late joiners benefit strongly: their partner list is empty, so most pairings are new
+      var newPartnerships = 0;
+      if (partnerCountA === 0) newPartnerships++;
+      if (partnerCountB === 0) newPartnerships++;
+      var newOpponentPairs = 0;
+      [[split.a[0], split.b[0]], [split.a[0], split.b[1]], [split.a[1], split.b[0]], [split.a[1], split.b[1]]].forEach(function (_ref3) {
+        var _ref4 = _slicedToArray(_ref3, 2),
+          x = _ref4[0],
+          y = _ref4[1];
+        if ((globalOpponents[pairKey(x, y)] || 0) === 0) newOpponentPairs++;
+      });
       return _objectSpread(_objectSpread({}, split), {}, {
         partnerCount: partnerCount,
-        oppCount: oppCount
+        oppCount: oppCount,
+        newPartnerships: newPartnerships,
+        newOpponentPairs: newOpponentPairs
       });
     });
-    // Best split minimizes partner + opponent repetitions
+    // Best split: MAXIMIZE new pairings, MINIMIZE repetitions
     scoredSplits.sort(function (x, y) {
-      var scoreX = x.partnerCount * 3 + x.oppCount * 1; // partner-repetition is more painful
-      var scoreY = y.partnerCount * 3 + y.oppCount * 1;
+      // Heavy priority on avoiding repeated partners, then favor new partnerships, then avoid repeated opponents
+      var scoreX = x.partnerCount * 10 - x.newPartnerships * 5 + x.oppCount * 2 - x.newOpponentPairs * 1;
+      var scoreY = y.partnerCount * 10 - y.newPartnerships * 5 + y.oppCount * 2 - y.newOpponentPairs * 1;
       return scoreX - scoreY;
     });
     var bestSplit = scoredSplits[0];
 
+    // === Combination-level diversity bonus ===
+    // If this combination includes a "late joiner" (few unique partners so far),
+    // reward pairing them with someone they haven't played with yet.
+    // "Late joiner" = uniquePartners is much lower than avg for this combo
+    var uniquePartnersInCombo = four.map(function (id) {
+      return stats[id].uniquePartners || 0;
+    });
+    var maxUniqueInCombo = Math.max.apply(Math, _toConsumableArray(uniquePartnersInCombo).concat([1]));
+    var minUniqueInCombo = Math.min.apply(Math, _toConsumableArray(uniquePartnersInCombo));
+    // A "diversity gap" indicates late joiner(s) among veterans
+    var diversityGap = maxUniqueInCombo - minUniqueInCombo;
+
     // Combination-level score: LOWER = BETTER
-    // Weights (tuned to prioritize rotation early, fairness late)
     var playedScore = totalPlayed * 100; // heavy penalty for players who already played a lot
     var waitScore = -Math.min(totalWaitMs / 60000, 240); // reward long waits (cap at 4h)
     var partnerRepScore = bestSplit.partnerCount * 50; // strong penalty for repeated partners
     var opponentRepScore = bestSplit.oppCount * 15; // moderate penalty for repeated opponents
+    // NEW: reward using this combination if it introduces new pairings (esp. important with late joiners)
+    var diversityBonus = -(bestSplit.newPartnerships * 30 + bestSplit.newOpponentPairs * 8);
+    // NEW: extra bonus when combo has both "late" and "veteran" players AND we're making new pairings
+    var bridgingBonus = diversityGap >= 2 && bestSplit.newPartnerships > 0 ? -20 : 0;
     var randomNoise = (Math.random() + rerollSeed * 0.7) * 30; // 0-30 point random jitter per reroll
 
-    var totalScore = playedScore + waitScore + partnerRepScore + opponentRepScore + randomNoise;
+    var totalScore = playedScore + waitScore + partnerRepScore + opponentRepScore + diversityBonus + bridgingBonus + randomNoise;
     return {
       four: four,
       split: bestSplit,
@@ -2397,10 +2439,10 @@ function PadelTournamentApp() {
 }
 
 // ============= JOIN TOURNAMENT MODAL =============
-function JoinTournamentModal(_ref4) {
-  var prefillCode = _ref4.prefillCode,
-    onClose = _ref4.onClose,
-    onJoin = _ref4.onJoin;
+function JoinTournamentModal(_ref6) {
+  var prefillCode = _ref6.prefillCode,
+    onClose = _ref6.onClose,
+    onJoin = _ref6.onJoin;
   var _useState23 = useState(prefillCode || ''),
     _useState24 = _slicedToArray(_useState23, 2),
     code = _useState24[0],
@@ -2545,17 +2587,17 @@ function JoinTournamentModal(_ref4) {
 }
 
 // ============= HEADER =============
-function Header(_ref5) {
-  var onReset = _ref5.onReset,
-    onArchive = _ref5.onArchive,
-    onDrafts = _ref5.onDrafts,
-    onJoin = _ref5.onJoin,
-    draftsCount = _ref5.draftsCount,
-    tournamentName = _ref5.tournamentName,
-    onUpdateName = _ref5.onUpdateName,
-    phase = _ref5.phase,
-    roomCode = _ref5.roomCode,
-    syncStatus = _ref5.syncStatus;
+function Header(_ref7) {
+  var onReset = _ref7.onReset,
+    onArchive = _ref7.onArchive,
+    onDrafts = _ref7.onDrafts,
+    onJoin = _ref7.onJoin,
+    draftsCount = _ref7.draftsCount,
+    tournamentName = _ref7.tournamentName,
+    onUpdateName = _ref7.onUpdateName,
+    phase = _ref7.phase,
+    roomCode = _ref7.roomCode,
+    syncStatus = _ref7.syncStatus;
   var _useState29 = useState(false),
     _useState30 = _slicedToArray(_useState29, 2),
     editingName = _useState30[0],
@@ -2717,8 +2759,8 @@ function Header(_ref5) {
 }
 
 // ============= SETUP PHASE =============
-function SetupPhase(_ref6) {
-  var onStart = _ref6.onStart;
+function SetupPhase(_ref8) {
+  var onStart = _ref8.onStart;
   var _useState33 = useState(1),
     _useState34 = _slicedToArray(_useState33, 2),
     step = _useState34[0],
@@ -3681,11 +3723,11 @@ function SetupPhase(_ref6) {
     size: 16
   }), " Turnier starten"))));
 }
-function LevelSelector(_ref7) {
-  var value = _ref7.value,
-    onChange = _ref7.onChange,
-    _ref7$size = _ref7.size,
-    size = _ref7$size === void 0 ? 22 : _ref7$size;
+function LevelSelector(_ref9) {
+  var value = _ref9.value,
+    onChange = _ref9.onChange,
+    _ref9$size = _ref9.size,
+    size = _ref9$size === void 0 ? 22 : _ref9$size;
   return /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-1"
   }, [1, 2, 3, 4, 5].map(function (lvl) {
@@ -3715,16 +3757,16 @@ function LevelSelector(_ref7) {
     }
   }, value));
 }
-function NumberStepper(_ref8) {
-  var label = _ref8.label,
-    value = _ref8.value,
-    _onChange = _ref8.onChange,
-    _ref8$min = _ref8.min,
-    min = _ref8$min === void 0 ? 0 : _ref8$min,
-    _ref8$max = _ref8.max,
-    max = _ref8$max === void 0 ? 999 : _ref8$max,
-    suffix = _ref8.suffix,
-    hint = _ref8.hint;
+function NumberStepper(_ref0) {
+  var label = _ref0.label,
+    value = _ref0.value,
+    _onChange = _ref0.onChange,
+    _ref0$min = _ref0.min,
+    min = _ref0$min === void 0 ? 0 : _ref0$min,
+    _ref0$max = _ref0.max,
+    max = _ref0$max === void 0 ? 999 : _ref0$max,
+    suffix = _ref0.suffix,
+    hint = _ref0.hint;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     className: "block text-sm uppercase tracking-wider mb-2",
     style: {
@@ -3762,15 +3804,15 @@ function NumberStepper(_ref8) {
     }
   }, hint));
 }
-function ModeCard(_ref9) {
-  var active = _ref9.active,
-    onClick = _ref9.onClick,
-    title = _ref9.title,
-    desc = _ref9.desc,
-    icon = _ref9.icon,
-    disabled = _ref9.disabled,
-    disabledReason = _ref9.disabledReason,
-    small = _ref9.small;
+function ModeCard(_ref1) {
+  var active = _ref1.active,
+    onClick = _ref1.onClick,
+    title = _ref1.title,
+    desc = _ref1.desc,
+    icon = _ref1.icon,
+    disabled = _ref1.disabled,
+    disabledReason = _ref1.disabledReason,
+    small = _ref1.small;
   return /*#__PURE__*/React.createElement("button", {
     onClick: onClick,
     disabled: disabled,
@@ -3802,11 +3844,11 @@ function ModeCard(_ref9) {
 }
 
 // ============= CHAMPIONS LEAGUE PHASE =============
-function ChampionsLeaguePhase(_ref0) {
-  var tournament = _ref0.tournament,
-    setTournament = _ref0.setTournament,
-    onFinish = _ref0.onFinish,
-    onPause = _ref0.onPause;
+function ChampionsLeaguePhase(_ref10) {
+  var tournament = _ref10.tournament,
+    setTournament = _ref10.setTournament,
+    onFinish = _ref10.onFinish,
+    onPause = _ref10.onPause;
   var _useState75 = useState('courts'),
     _useState76 = _slicedToArray(_useState75, 2),
     view = _useState76[0],
@@ -4360,14 +4402,14 @@ function ChampionsLeaguePhase(_ref0) {
     onReroll: rerollBulkFill
   }));
 }
-function CLCourtCard(_ref1) {
+function CLCourtCard(_ref11) {
   var _court$match;
-  var court = _ref1.court,
-    idx = _ref1.idx,
-    tournament = _ref1.tournament,
-    onRequestMatch = _ref1.onRequestMatch,
-    onSubmitScore = _ref1.onSubmitScore,
-    onCancel = _ref1.onCancel;
+  var court = _ref11.court,
+    idx = _ref11.idx,
+    tournament = _ref11.tournament,
+    onRequestMatch = _ref11.onRequestMatch,
+    onSubmitScore = _ref11.onSubmitScore,
+    onCancel = _ref11.onCancel;
   var _useState89 = useState(''),
     _useState90 = _slicedToArray(_useState89, 2),
     scoreA = _useState90[0],
@@ -4633,15 +4675,15 @@ function CLCourtCard(_ref1) {
 }
 
 // ============= MATCH SUGGESTION MODAL =============
-function MatchSuggestionModal(_ref10) {
+function MatchSuggestionModal(_ref12) {
   var _previewsAvailable$0$, _previewsAvailable$0$2, _getPlayer3;
-  var pendingMatch = _ref10.pendingMatch,
-    tournament = _ref10.tournament,
-    occupiedPlayerIds = _ref10.occupiedPlayerIds,
-    onConfirm = _ref10.onConfirm,
-    onCancel = _ref10.onCancel,
-    onSwap = _ref10.onSwap,
-    onReroll = _ref10.onReroll;
+  var pendingMatch = _ref12.pendingMatch,
+    tournament = _ref12.tournament,
+    occupiedPlayerIds = _ref12.occupiedPlayerIds,
+    onConfirm = _ref12.onConfirm,
+    onCancel = _ref12.onCancel,
+    onSwap = _ref12.onSwap,
+    onReroll = _ref12.onReroll;
   var _useState101 = useState(null),
     _useState102 = _slicedToArray(_useState101, 2),
     swapSlot = _useState102[0],
@@ -5001,12 +5043,12 @@ function MatchSuggestionModal(_ref10) {
     size: 14
   }), " Match starten")))));
 }
-function PendingPlayerCard(_ref11) {
+function PendingPlayerCard(_ref13) {
   var _context$played;
-  var player = _ref11.player,
-    context = _ref11.context,
-    onClick = _ref11.onClick,
-    isSwapping = _ref11.isSwapping;
+  var player = _ref13.player,
+    context = _ref13.context,
+    onClick = _ref13.onClick,
+    isSwapping = _ref13.isSwapping;
   var played = (_context$played = context === null || context === void 0 ? void 0 : context.played) !== null && _context$played !== void 0 ? _context$played : 0;
   var waitMs = context === null || context === void 0 ? void 0 : context.waitMs;
   var waitLabel = waitMs !== null && waitMs !== undefined ? formatDurationShort(waitMs) : null;
@@ -5040,15 +5082,15 @@ function PendingPlayerCard(_ref11) {
 }
 
 // ============= BULK FILL MODAL =============
-function BulkFillModal(_ref12) {
+function BulkFillModal(_ref14) {
   var _getPlayer4, _bulkFillPending$prop;
-  var bulkFillPending = _ref12.bulkFillPending,
-    tournament = _ref12.tournament,
-    occupiedPlayerIds = _ref12.occupiedPlayerIds,
-    onConfirm = _ref12.onConfirm,
-    onCancel = _ref12.onCancel,
-    onSwap = _ref12.onSwap,
-    onReroll = _ref12.onReroll;
+  var bulkFillPending = _ref14.bulkFillPending,
+    tournament = _ref14.tournament,
+    occupiedPlayerIds = _ref14.occupiedPlayerIds,
+    onConfirm = _ref14.onConfirm,
+    onCancel = _ref14.onCancel,
+    onSwap = _ref14.onSwap,
+    onReroll = _ref14.onReroll;
   var _useState105 = useState(null),
     _useState106 = _slicedToArray(_useState105, 2),
     swapTarget = _useState106[0],
@@ -5462,8 +5504,8 @@ function BulkFillModal(_ref12) {
 }
 
 // ============= CL STANDINGS =============
-function CLStandings(_ref13) {
-  var tournament = _ref13.tournament;
+function CLStandings(_ref15) {
+  var tournament = _ref15.tournament;
   var standings = computeChampionsLeagueStandings(tournament);
   var _useState107 = useState(null),
     _useState108 = _slicedToArray(_useState107, 2),
@@ -5614,10 +5656,10 @@ function CLStandings(_ref13) {
     }
   }));
 }
-function PlayerDetailModal(_ref14) {
-  var player = _ref14.player,
-    tournament = _ref14.tournament,
-    onClose = _ref14.onClose;
+function PlayerDetailModal(_ref16) {
+  var player = _ref16.player,
+    tournament = _ref16.tournament,
+    onClose = _ref16.onClose;
   var getName = function getName(pid) {
     var _tournament$players$f2;
     return ((_tournament$players$f2 = tournament.players.find(function (p) {
@@ -5794,8 +5836,8 @@ function PlayerDetailModal(_ref14) {
 }
 
 // ============= CL HISTORY =============
-function CLHistoryView(_ref15) {
-  var tournament = _ref15.tournament;
+function CLHistoryView(_ref17) {
+  var tournament = _ref17.tournament;
   var _useState109 = useState(null),
     _useState110 = _slicedToArray(_useState109, 2),
     filterPlayerId = _useState110[0],
@@ -5909,8 +5951,8 @@ function CLHistoryView(_ref15) {
 }
 
 // ============= ROOM CODE BANNER =============
-function RoomCodeBanner(_ref16) {
-  var tournament = _ref16.tournament;
+function RoomCodeBanner(_ref18) {
+  var tournament = _ref18.tournament;
   var _useState111 = useState(false),
     _useState112 = _slicedToArray(_useState111, 2),
     copied = _useState112[0],
@@ -6040,10 +6082,10 @@ function RoomCodeBanner(_ref16) {
 }
 
 // ============= COURT MANAGEMENT MODAL =============
-function CourtManagementModal(_ref17) {
-  var tournament = _ref17.tournament,
-    setTournament = _ref17.setTournament,
-    onClose = _ref17.onClose;
+function CourtManagementModal(_ref19) {
+  var tournament = _ref19.tournament,
+    setTournament = _ref19.setTournament,
+    onClose = _ref19.onClose;
   var addCourt = function addCourt() {
     var newId = "c".concat(tournament.courts.length + 1, "_").concat(Date.now());
     setTournament(function (prev) {
@@ -6149,11 +6191,11 @@ function CourtManagementModal(_ref17) {
 }
 
 // ============= PLAYING PHASE (existing Americano/Fixed) =============
-function PlayingPhase(_ref18) {
-  var tournament = _ref18.tournament,
-    setTournament = _ref18.setTournament,
-    onFinish = _ref18.onFinish,
-    onPause = _ref18.onPause;
+function PlayingPhase(_ref20) {
+  var tournament = _ref20.tournament,
+    setTournament = _ref20.setTournament,
+    onFinish = _ref20.onFinish,
+    onPause = _ref20.onPause;
   var _useState113 = useState('matches'),
     _useState114 = _slicedToArray(_useState113, 2),
     view = _useState114[0],
@@ -6374,13 +6416,13 @@ function PlayingPhase(_ref18) {
     }
   }));
 }
-function MatchCard(_ref19) {
+function MatchCard(_ref21) {
   var _result$scoreA, _result$scoreB;
-  var match = _ref19.match,
-    tournament = _ref19.tournament,
-    result = _ref19.result,
-    onSubmit = _ref19.onSubmit,
-    onClear = _ref19.onClear;
+  var match = _ref21.match,
+    tournament = _ref21.tournament,
+    result = _ref21.result,
+    onSubmit = _ref21.onSubmit,
+    onClear = _ref21.onClear;
   var _useState117 = useState(false),
     _useState118 = _slicedToArray(_useState117, 2),
     editing = _useState118[0],
@@ -6561,8 +6603,8 @@ function MatchCard(_ref19) {
     }
   }, result.scoreB)))));
 }
-function Standings(_ref20) {
-  var tournament = _ref20.tournament;
+function Standings(_ref22) {
+  var tournament = _ref22.tournament;
   var isFixed = tournament.mode === 'fixed';
   var standings = isFixed ? computeFixedStandings(tournament) : computeAmericanoStandings(tournament);
   var useMP = !isFixed && tournament.americanoScoring === 'match_points';
@@ -6694,8 +6736,8 @@ function Standings(_ref20) {
     }, total)));
   })))));
 }
-function HistoryView(_ref21) {
-  var tournament = _ref21.tournament;
+function HistoryView(_ref23) {
+  var tournament = _ref23.tournament;
   var played = tournament.schedule.filter(function (r) {
     return r.matches.some(function (m) {
       return tournament.results[m.id] !== undefined;
@@ -6803,11 +6845,11 @@ function HistoryView(_ref21) {
 }
 
 // ============= PLAYER MANAGEMENT MODAL =============
-function PlayerManagementModal(_ref22) {
-  var tournament = _ref22.tournament,
-    setTournament = _ref22.setTournament,
-    onClose = _ref22.onClose,
-    isChampionsLeague = _ref22.isChampionsLeague;
+function PlayerManagementModal(_ref24) {
+  var tournament = _ref24.tournament,
+    setTournament = _ref24.setTournament,
+    onClose = _ref24.onClose,
+    isChampionsLeague = _ref24.isChampionsLeague;
   var _useState123 = useState({}),
     _useState124 = _slicedToArray(_useState123, 2),
     editingIds = _useState124[0],
@@ -7219,11 +7261,11 @@ function PlayerManagementModal(_ref22) {
     }
   }));
 }
-function RemovePlayerDialog(_ref23) {
-  var player = _ref23.player,
-    hasResults = _ref23.hasResults,
-    onConfirm = _ref23.onConfirm,
-    onCancel = _ref23.onCancel;
+function RemovePlayerDialog(_ref25) {
+  var player = _ref25.player,
+    hasResults = _ref25.hasResults,
+    onConfirm = _ref25.onConfirm,
+    onCancel = _ref25.onCancel;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       position: 'fixed',
@@ -7442,11 +7484,11 @@ var shareTournament = /*#__PURE__*/function () {
 }();
 
 // ============= FINISHED PHASE =============
-function FinishedPhase(_ref24) {
-  var tournament = _ref24.tournament,
-    onReset = _ref24.onReset,
-    onArchive = _ref24.onArchive,
-    onBack = _ref24.onBack;
+function FinishedPhase(_ref26) {
+  var tournament = _ref26.tournament,
+    onReset = _ref26.onReset,
+    onArchive = _ref26.onArchive,
+    onBack = _ref26.onBack;
   var isCL = tournament.mode === 'champions_league';
   var standings = isCL ? computeChampionsLeagueStandings(tournament).filter(function (s) {
     return s.qualified;
@@ -7534,11 +7576,11 @@ function FinishedPhase(_ref24) {
 }
 
 // ============= ARCHIVE MODAL =============
-function ArchiveModal(_ref25) {
-  var version = _ref25.version,
-    onClose = _ref25.onClose,
-    onView = _ref25.onView,
-    onDelete = _ref25.onDelete;
+function ArchiveModal(_ref27) {
+  var version = _ref27.version,
+    onClose = _ref27.onClose,
+    onView = _ref27.onView,
+    onDelete = _ref27.onDelete;
   var archive = useMemo(function () {
     return loadArchive();
   }, [version]);
@@ -7654,12 +7696,12 @@ function ArchiveModal(_ref25) {
 }
 
 // ============= DRAFTS MODAL =============
-function DraftsModal(_ref26) {
-  var version = _ref26.version,
-    hasActiveTournament = _ref26.hasActiveTournament,
-    onClose = _ref26.onClose,
-    onResume = _ref26.onResume,
-    onDelete = _ref26.onDelete;
+function DraftsModal(_ref28) {
+  var version = _ref28.version,
+    hasActiveTournament = _ref28.hasActiveTournament,
+    onClose = _ref28.onClose,
+    onResume = _ref28.onResume,
+    onDelete = _ref28.onDelete;
   var drafts = useMemo(function () {
     return loadDrafts();
   }, [version]);
@@ -7799,9 +7841,9 @@ function DraftsModal(_ref26) {
 }
 
 // ============= ARCHIVED TOURNAMENT VIEW =============
-function ArchivedTournamentView(_ref27) {
-  var tournament = _ref27.tournament,
-    onClose = _ref27.onClose;
+function ArchivedTournamentView(_ref29) {
+  var tournament = _ref29.tournament,
+    onClose = _ref29.onClose;
   var isCL = tournament.mode === 'champions_league';
   return /*#__PURE__*/React.createElement("div", {
     style: {
